@@ -1,0 +1,70 @@
+# Default configuration for the loan-tape data-quality pipeline.
+# Every threshold used by a rule is here; rule code contains no magic numbers.
+# `as_of: null` means "infer from the latest date in the tape" (recorded in the report header).
+
+lender: default
+as_of: null
+
+lateness:
+  default_days: 90          # brief: 90+ day gap between scheduled and actual payment = default
+  medium_days: 30           # 30-89 days late = watch-band credit event (rule F3)
+  watch_flag_days: 60       # F3 is medium (flags the loan) if still unpaid or a paid delay >= 60 d;
+                            # paid delays of 30-59 d are low (reported, loan stays normal)
+  grace_days: 5             # lender marks rows paid <= 5 days after due as "paid on time"
+  habitual_late_share: 0.5  # >= 50 % of paid instalments late (but never >= 30 d) = "habitually late"
+  trend_min_paid: 6         # need >= 6 paid instalments before reporting a lateness trend
+  drift_recent_episodes: 3  # G8: compare the last 3 paid due dates against everything before
+  drift_min_exceeding: 2    # G8 fires when >= 2 of those 3 ran past grace after a within-grace baseline
+
+tolerance:
+  amount_eur: 0.50                # Loan amount is integer-rounded in this tape (max drift 0.49)
+  principal_gap_material_share: 0.10  # schedule-vs-amount gap above this share of the loan = high
+  interest_eur: 1.00
+  days_late_days: 5               # summary "Days late" vs diary-derived current days past due
+  instalment_interest_rel: 0.15   # per-instalment interest vs balance*rate/12; 30/360 vs actual/365 drift ~ 9 %
+  instalment_interest_eur: 0.50
+  schedule_gap_days: 45           # due dates further apart than this = missing schedule row
+  schedule_min_gap_days: 20       # due dates closer than this (same type) = duplicated schedule row
+  expected_repayment_days: 45     # Expected repayment date vs Disbursal + term
+  repayment_date_slack_days: 3    # last actual payment may trail the loan-level Repayment date by this
+  grace_state_days: 15            # "payment in grace period" rows must be within this many days of due
+  as_of_isolated_days: 45         # inferred as-of resting on one date more than a monthly cycle past the next-latest is called out
+
+xirr:
+  min_inflows: 3
+  min_realised_interest_share: 0.10
+  gap_percentage_points: 5.0
+  gap_relative: 0.40
+  low_rate_floor: -0.99
+  high_rate_ceiling: 10.0
+
+plausibility:
+  min_age: 18
+  max_age: 100
+  min_interest_rate: 0
+  max_interest_rate: 100
+  min_term_months: 1
+  max_term_months: 360
+  max_payment_to_income: 1.0
+
+tape:
+  circuit_breaker_share: 0.40   # severe integrity review gate, not an expected anomaly rate
+  excel_cell_limit: 32767
+  benford_min_sample: 500       # distinct paid amounts needed before I4 reports statistics
+  benford_min_loans: 200        # loans needed before I4 gives a pass/fail (below: info only)
+  benford_max_mad: 0.015        # first-digit mean absolute deviation above this = fail
+  duplicate_amount_floor_eur: 50  # I5 lists non-round paid amounts >= this shared by loans
+  round_min_sample: 100         # computed amounts needed before I6 is evaluable
+  round_share_max: 0.10         # share of computed amounts ending in .00 above this = fail
+  round_min_days_late: 30       # non-zero Days late values needed to report the 30-day cluster
+
+verdict:
+  flag_min_severity: medium     # brief: clean = "no major issues"; low findings stay visible but do not flag
+
+disabled_rules: []
+info_only_rules: []
+
+# Opt-in post-processors (src/loan_dq/plugins.py). A plugin may annotate loans, never change a
+# verdict, severity or reason; a plugin that tries is discarded and the report restored.
+# Available: triage (deterministic review order). Empty = the report is exactly the rules' output.
+plugins: []

@@ -1,0 +1,159 @@
+# Loan-tape data-quality pipeline — CI/CD.
+#
+#   PR / main: locked lint, type-check, tests and dev/prod CDK synthesis.
+#   Native ARM64: build the staged CDK asset and smoke-test its immutable local image ID.
+#   main (manual): OIDC-federated publish of the verified asset to a private ECR repo.
+#
+# No long-lived AWS keys exist in this pipeline. The automatic steps use no credentials at
+# all. The manual `publish` step authenticates through Bitbucket OIDC identity federation:
+# AWS STS verifies the short-lived OIDC token, checks the role trust policy (scoped to this
+# workspace, this repository UUID and the `main` branch) and returns temporary credentials
+# scoped to a deployment role that may only push to one ECR repository. A compromised runner
+# can leak nothing permanent. `publish` is `trigger: manual` and never runs on its own.
+#
+# Prerequisites, configured once in the AWS account (not in this repo):
+#   - an IAM OIDC identity provider for
+#     api.bitbucket.org/2.0/workspaces/<workspace>/pipelines-config/identity/oidc
+#   - an IAM role whose trust policy restricts `sub` to this repo UUID + `main`, and whose
+#     permission policy allows only ecr:GetAuthorizationToken and the ecr layer/put actions
+#     on the single target repository
+#   - repository variables: AWS_OIDC_ROLE_ARN, AWS_REGION, ECR_REPOSITORY
+
+image: python:3.12-slim
+
+definitions:
+  caches:
+    pip: ~/.cache/pip
+  services:
+    docker:
+      memory: 4096
+  steps:
+    - step: &quality
+        name: Locked lint, type-check, unit and infrastructure tests
+        caches:
+          - pip
+        script:
+          - apt-get update && apt-get install -y --no-install-recommends nodejs
+          - pip install uv==0.11.31
+          - uv lock --check
+          - uv export --locked --extra aws --extra parquet --group build --no-dev --no-emit-project --no-annotate --no-header | diff requirements-runtime.lock -
+          - uv sync --frozen --all-extras
+          - uv run --frozen --all-extras python -c "import aws_cdk"
+          - uv run --frozen --all-extras ruff check .
+          - uv run --frozen --all-extras ruff format --check .
+          - uv run --frozen --all-extras mypy
+          - uv run --frozen --all-extras pytest -q --cov=loan_dq --cov-report=term-missing --cov-fail-under=85
+          - uv run --frozen --all-extras python scripts/admission.py data/loans.xlsx --clean 32271989 99981632 --seeded 37216892
+        artifacts:
+          - reports/**
+
+    - step: &verify-asset
+        name: Synthesize and smoke-test the exact ARM64 CDK image asset (no publish)
+        image: node:22-bookworm
+        size: 2x
+        runtime:
+          cloud:
+            arch: arm
+        services:
+          - docker
+        caches:
+          - pip
+        script:
+          - apt-get update && apt-get install -y --no-install-recommends python3 python3-venv docker.io
+          - python3 -m venv infra/.venv
+          - infra/.venv/bin/pip install uv==0.11.31
+          - infra/.venv/bin/uv sync --frozen --all-extras --python 3.12
+          - export PATH="$BITBUCKET_CLONE_DIR/.venv/bin:$PATH"
+          - (cd infra && npx --yes aws-cdk@2.150.0 synth --output cdk.out -c stage=dev --quiet)
+          - (cd infra && npx --yes aws-cdk@2.150.0 synth --output cdk.prod.out -c stage=prod --quiet)
+          - |
+            python - <<'PY'
+            import json
+            import pathlib
+            import subprocess
+
+            assembly = pathlib.Path("infra/cdk.out")
+            manifest = json.loads((assembly / "LoanTapeIngestion-dev.assets.json").read_text())
+            [(asset_id, asset)] = manifest["dockerImages"].items()
+            source = asset["source"]
+            assert source["platform"] == "linux/arm64"
+            assert all(d["imageTag"] == asset_id for d in asset["destinations"].values())
+            template = (assembly / "LoanTapeIngestion-dev.template.json").read_text()
+            assert asset_id in template
+            prod = pathlib.Path("infra/cdk.prod.out")
+            prod_assets = json.loads((prod / "LoanTapeIngestion-prod.assets.json").read_text())
+            assert set(prod_assets["dockerImages"]) == {asset_id}
+            assert asset_id in (prod / "LoanTapeIngestion-prod.template.json").read_text()
+            context = assembly / source["directory"]
+            tag = "cdkasset-" + asset_id
+            subprocess.run([
+                "docker", "build", "--platform", source["platform"],
+                "--file", str(context / source["dockerFile"]), "--tag", tag, str(context),
+            ], check=True)
+            image = json.loads(subprocess.check_output(["docker", "image", "inspect", tag]))[0]
+            assert image["Architecture"] == "arm64"
+            subprocess.run([
+                "docker", "run", "--rm", "--platform", "linux/arm64", "--network", "none",
+                "--entrypoint", "python", image["Id"], "/var/task/smoke.py",
+            ], check=True)
+            (assembly / "verified-image.json").write_text(json.dumps({
+                "cdk_asset_id": asset_id,
+                "local_image_id": image["Id"],
+                "platform": source["platform"],
+                "stages": ["dev", "prod"],
+                "smoke_passed": True,
+                "published": False,
+            }, indent=2) + "\n")
+            PY
+        artifacts:
+          - infra/cdk.out/**
+          - infra/cdk.prod.out/**
+
+    - step: &publish
+        name: OIDC publish the verified ARM64 asset to private ECR (manual)
+        image: node:22-bookworm
+        size: 2x
+        runtime:
+          cloud:
+            arch: arm
+        oidc: true
+        services:
+          - docker
+        script:
+          - apt-get update && apt-get install -y --no-install-recommends awscli jq docker.io
+          # 1 · exchange the short-lived Bitbucket OIDC token for temporary, role-scoped credentials
+          - >
+            CREDS=$(aws sts assume-role-with-web-identity
+            --role-arn "$AWS_OIDC_ROLE_ARN"
+            --role-session-name "bb-${BITBUCKET_BUILD_NUMBER}"
+            --web-identity-token "$BITBUCKET_STEP_OIDC_TOKEN"
+            --duration-seconds 900
+            --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+          - export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | cut -f1)
+          - export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | cut -f2)
+          - export AWS_SESSION_TOKEN=$(echo "$CREDS" | cut -f3)
+          - ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          - REGISTRY="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          # 2 · rebuild the exact synthesised asset (deterministic) and confirm it matches the verified id
+          - ASSET_ID=$(jq -r '.cdk_asset_id' infra/cdk.out/verified-image.json)
+          - SRC=$(jq -r --arg a "$ASSET_ID" '.dockerImages[$a].source' infra/cdk.out/LoanTapeIngestion-dev.assets.json)
+          - CTX="infra/cdk.out/$(echo "$SRC" | jq -r .directory)"
+          - DOCKERFILE="$CTX/$(echo "$SRC" | jq -r .dockerFile)"
+          - docker build --platform linux/arm64 -f "$DOCKERFILE" -t "detector:${ASSET_ID}" "$CTX"
+          # 3 · login with the temporary credentials and push; no key is ever written to disk
+          - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+          - docker tag "detector:${ASSET_ID}" "${REGISTRY}/${ECR_REPOSITORY}:${ASSET_ID}"
+          - docker push "${REGISTRY}/${ECR_REPOSITORY}:${ASSET_ID}"
+
+pipelines:
+  pull-requests:
+    "**":
+      - step: *quality
+      - step: *verify-asset
+  branches:
+    main:
+      - step: *quality
+      - step: *verify-asset
+      - step:
+          <<: *publish
+          trigger: manual

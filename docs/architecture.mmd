@@ -1,0 +1,84 @@
+---
+title: "Part 2 · Loan-tape onboarding on AWS — solid blue = built in infra/ (cdk synth passes) · dashed grey = production design · nothing deployed"
+config:
+  theme: neutral
+  themeVariables:
+    fontSize: 18px
+  flowchart:
+    nodeSpacing: 30
+    rankSpacing: 50
+    padding: 12
+    wrappingWidth: 280
+---
+flowchart TB
+    subgraph INGEST["1 · INGEST  —  exact source version, encrypted at rest"]
+        direction LR
+        L["Lender uploads tape<br/>xlsx · csv · parquet · jsonl"]
+        RAW[("Amazon S3 raw-tapes<br/>versioned · private · SSE-KMS<br/>explicit snapshot date")]
+        EB{{"Amazon EventBridge<br/>Object Created · at-least-once"}}
+        KMS["AWS KMS customer-managed key<br/>buckets · queue · topic · logs"]
+        MAC["Amazon Macie scan<br/>DESIGNED"]
+        VAULT[("PII vault bucket<br/>own key · break-glass role<br/>DESIGNED")]
+        L -->|upload| RAW --> EB
+        KMS -.- RAW
+        RAW -.-> MAC
+        RAW -.->|"split PII · keep token + age band"| VAULT
+    end
+
+    subgraph PROCESS["2 · PROCESS  —  the same Part 1 detector, one image"]
+        direction LR
+        LAM["AWS Lambda · container image<br/>reads exact object version · size gate<br/>isolated workspace · claims the run first"]
+        SFN["AWS Step Functions (Standard)<br/>Distributed Map: shard → detect → merge<br/>DESIGNED · tapes above Lambda limits"]
+        FAR["Amazon ECS Fargate task<br/>one shard per task · same image<br/>DESIGNED"]
+        XRAY["AWS X-Ray tracing<br/>per-run timeline across S3 · Lambda · DynamoDB<br/>points a slow / failed run at the exact step<br/>DESIGNED"]
+        LAM -.->|"size > threshold"| SFN -.-> FAR
+        LAM -.- XRAY
+        SFN -.- XRAY
+    end
+
+    subgraph STORE["3 · STORE  —  the manifest is the truth, not the bucket listing"]
+        direction LR
+        DDB[("Amazon DynamoDB run state<br/>conditional claim · lease · attempt owner<br/>manifest: accepted / review_required / rejected")]
+        RES[("Amazon S3 results<br/>per-attempt JSON · summary · payments · coverage<br/>versioned")]
+        RDS[("Amazon Aurora PostgreSQL<br/>transactional loader · accepted runs only<br/>DESIGNED")]
+        ATH["Amazon Athena over S3 Parquet<br/>ad-hoc history across tapes<br/>DESIGNED"]
+        DDB -.->|"accepted manifest"| RDS
+        RES -.-> RDS
+        RES -.-> ATH
+    end
+
+    subgraph SERVE["4 · SERVE  —  tenant-scoped, human release"]
+        direction LR
+        API["Amazon API Gateway + Lambda<br/>tenant-scoped auth · row-level security<br/>DESIGNED"]
+        SCORE["Downstream scoring & reporting<br/>human release · data rollback<br/>DESIGNED"]
+        GRAPH["Amazon Neptune / ArangoDB<br/>cross-loan links · recycled borrower · concentration<br/>EXTENSION · downstream of the detector"]
+        API -.-> SCORE
+        SCORE -.-> GRAPH
+    end
+
+    subgraph OBSERVE["5 · OBSERVE, AUDIT & FAIL SAFELY  —  bounded retries, nothing lost silently"]
+        direction LR
+        DLQ[["Amazon SQS dead-letter queue<br/>delivery + execution failures · KMS<br/>14-day retention · manual replay"]]
+        CW["Amazon CloudWatch<br/>retained logs · metrics · 3 alarms:<br/>detector errors · DLQ depth · quality hold"]
+        SNS["Amazon SNS alarm topic<br/>KMS-encrypted"]
+        RESP["AWS Lambda responder<br/>enriches the alert: exact error + deep link to<br/>log stream and run diagnostics<br/>auto-redrives known-transient DLQ · DESIGNED"]
+        PAGER["Pager / chat subscription<br/>replay tooling<br/>DESIGNED"]
+        TRAIL["AWS CloudTrail<br/>every API call on buckets · KMS key · run table<br/>account-level audit — who touched a lender's data<br/>DESIGNED"]
+        DLQ --> CW --> SNS
+        SNS -.-> RESP -.-> PAGER
+        RESP -.->|"redrive transient"| DLQ
+        TRAIL -.-> CW
+    end
+
+    INGEST -->|"Object Created event invokes the detector"| PROCESS
+    PROCESS -->|"claim run → write attempt artifacts → store manifest + final status"| STORE
+    PROCESS -->|"delivery / execution failure · logs · metrics · traces"| OBSERVE
+    STORE -.->|"accepted manifests only"| SERVE
+
+    classDef built fill:#e8f1fb,stroke:#1f4e79,stroke-width:2px,color:#0b2545
+    classDef designed fill:#f7f7f7,stroke:#7a7a7a,stroke-width:2px,stroke-dasharray:6 4,color:#333
+    classDef actor fill:#fff,stroke:#333,stroke-width:1px
+
+    class RAW,EB,LAM,DLQ,DDB,RES,CW,SNS,KMS built
+    class SFN,FAR,RDS,ATH,API,SCORE,PAGER,MAC,VAULT,XRAY,RESP,TRAIL,GRAPH designed
+    class L actor

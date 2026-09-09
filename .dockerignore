@@ -1,0 +1,21 @@
+# Build context for infra/lambda/Dockerfile is the repo root; keep it minimal.
+**/.venv
+**/venv
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/*.egg-info
+**/cdk*.out
+**/.DS_Store
+tmp
+.coverage
+.git
+.github
+reports
+docs
+tests
+data
+MINDMAP.md

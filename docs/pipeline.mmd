@@ -1,0 +1,92 @@
+---
+title: "Part A · Loan-tape detector — six processing stages, three check groups"
+config:
+  layout: elk
+  markdownAutoWrap: false
+  theme: base
+  themeVariables:
+    fontFamily: Arial
+    fontSize: 18px
+    primaryTextColor: "#17324d"
+    lineColor: "#607384"
+    clusterBkg: "#ffffff"
+    clusterBorder: "#c7d3df"
+  flowchart:
+    nodeSpacing: 28
+    rankSpacing: 38
+    padding: 14
+    wrappingWidth: 400
+    htmlLabels: true
+---
+flowchart TB
+    INPUT[("Lender loan tape<br/>Excel · CSV · Parquet · JSONL<br/>Loan summaries + nested payments diary<br/>Supplied workbook: 72 loan rows")]
+
+    subgraph READ["1 · READ — preserve the source; load usable input"]
+        direction LR
+        RAW["Read the table and hash the source<br/>Handle supported file formats<br/>No financial verdict at this stage"]
+        REJECT["Input guards during read / ingest<br/>Unusable file or ambiguous schema → reject<br/>An empty usable population is not success<br/>Recoverable row problems do not stop other rows"]
+        RAW --- REJECT
+    end
+
+    subgraph INGEST["2 · INGEST — normalise once; retain evidence, not guesses"]
+        direction LR
+        NORMALISE["Parse known fields into typed values<br/>Numbers · dates · IDs · labels<br/>Missing or invalid is not silently zero"]
+        DIARY["Extract typed payment component records<br/>Keep source row + payment sequence<br/>Tag duplicates / settlement representations<br/>Do not double-count the same cash"]
+        COVERAGE["Preserve issues and coverage<br/>13 diaries cut at 32,767 characters<br/>Salvage complete records; missing tails stay unknown<br/>Quarantine unusable rows with their reasons"]
+        NORMALISE --> DIARY --> COVERAGE
+    end
+
+    subgraph ANCHOR["3 · ANCHOR — one reporting date for the tape"]
+        direction LR
+        ASOF["Use --as-of when supplied<br/>Otherwise infer from observed event dates<br/>Exclude future scheduled due dates<br/>Supplied tape: 2025-01-23"]
+        TIME_GUARD["No usable reference → require --as-of<br/>An isolated inferred maximum produces a warning<br/>Snapshot date is not the computer's current date"]
+        ASOF --- TIME_GUARD
+    end
+
+    subgraph INSPECT["4 · INSPECT — 50 checks per loan; no runtime calibration against the clean examples"]
+        direction LR
+        CONSISTENCY["Group 1 · RECORD CONSISTENCY — 43 checks<br/>Usable fields and recorded ingestion issues<br/>Summary / diary totals · amounts · pending balances<br/>Dates · statuses · plausibility · guarded XIRR"]
+        BEHAVIOUR["Group 2 · REPAYMENT BEHAVIOUR — 7 checks<br/>Paid late / still overdue / stopped payments<br/>30–89-day watch band · 90+ day default threshold<br/>Habits and changes from earlier behaviour"]
+        OUTCOMES["Each check returns<br/>pass / fail / not_evaluable<br/>Reason and appropriate evidence<br/>Missing evidence is different from a pass"]
+        CONSISTENCY --> OUTCOMES
+        BEHAVIOUR --> OUTCOMES
+        CONSISTENCY ~~~ BEHAVIOUR
+    end
+
+    subgraph JUDGE["5 · JUDGE — decide per loan, then assess the whole population"]
+        direction LR
+        LOAN["Per-loan result<br/>Link root findings and related symptoms<br/>Severity: info → low → medium → high → critical<br/>Default flag floor: medium<br/>Keep integrity, credit event and coverage separate"]
+        WHOLE["Group 3 · WHOLE-TAPE QUALITY — 6 checks<br/>Duplicate IDs · conflicting borrower details<br/>Severe-integrity share · digit / shared-row screens<br/>Plus a separate export-health summary<br/>Runs after loan results; once after shard merge"]
+        ELIGIBILITY["Technical publication status<br/>accepted / review_required / rejected<br/>Account for evaluated and quarantined rows<br/>Incomplete coverage can hold a completed run<br/>Acceptance is not borrower credit approval"]
+        RESULT["Supplied-tape result — not a target<br/>15 major · 10 minor · 13 indeterminate · 34 clean<br/>15 have partial coverage: 13 truncated + 2 major<br/>Publication: review_required"]
+        LOAN --> WHOLE --> ELIGIBILITY
+        ELIGIBILITY --- RESULT
+    end
+
+    subgraph REPORT["6 · REPORT — default run: four files plus console output"]
+        direction LR
+        JSON[("loans_report.json<br/>Full findings, outcomes, groups and tape checks<br/>Input SHA-256 · ruleset · config digest · as-of")]
+        SUMMARY[("loans_summary.csv<br/>One row per loan or quarantined input row<br/>Tier · severity · groups · axes · reasons")]
+        PAYMENTS[("loans_payments.csv<br/>One row per payment component<br/>Dates · amounts · paid / pending · balances<br/>Source identity and convention tags")]
+        DIARY_SUMMARY[("loans_diary_coverage.csv<br/>One row per parsed loan<br/>Diary survival · spans · sums<br/>Compare with loan-summary balances")]
+        CONSOLE["Console stdout<br/>Readable summary and health observations<br/>Capture separately as loans_console.txt"]
+    end
+
+    QA["DEVELOPMENT / CI — outside the runtime stages<br/>admission.py → rule_admission.md<br/>Synthetic positive / negative tests<br/>Two clean anchors and one irregular anchor<br/>High firing rates prompt investigation, not automatic rejection<br/>No target flag percentage or claim of measured recall"]
+    LIMITS["Interpretation boundaries<br/>Groups are categories, not extra processing stages.<br/>Inspect and the loan decision repeat per loan; whole-tape checks follow.<br/>A truncated diary can still support some checks; others are not_evaluable.<br/>XIRR differences need context. Benford cannot prove fabrication and is not_evaluable here.<br/>Outputs remain sensitive financial data; no automatic financial correction."]
+
+    INPUT --> READ --> INGEST --> ANCHOR --> INSPECT --> JUDGE --> REPORT
+    INSPECT -.-|validated separately| QA
+    REPORT ~~~ LIMITS
+
+    classDef prep fill:#e8f1fb,stroke:#1f4e79,stroke-width:2px,color:#102a43
+    classDef check fill:#fff7df,stroke:#ba8b20,stroke-width:2px,color:#574318
+    classDef output fill:#edf7ed,stroke:#398448,stroke-width:2px,color:#184c24
+    classDef note fill:#f5f7f9,stroke:#768798,stroke-width:1px,stroke-dasharray:6 4,color:#334e68
+    classDef caution fill:#fff1ec,stroke:#b86648,stroke-width:1px,color:#743d29
+
+    class RAW,NORMALISE,DIARY,ASOF,LOAN,ELIGIBILITY prep
+    class CONSISTENCY,BEHAVIOUR,WHOLE,OUTCOMES check
+    class INPUT,JSON,SUMMARY,PAYMENTS,DIARY_SUMMARY,CONSOLE,RESULT output
+    class QA,LIMITS,TIME_GUARD note
+    class REJECT,COVERAGE caution
